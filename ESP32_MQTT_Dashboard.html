@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 智慧車輛安全監控</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<style>
+:root{font-family:system-ui,"Noto Sans TC",sans-serif;color:#eaf0f8;background:#101827}
+*{box-sizing:border-box}body{margin:0;padding:20px;max-width:980px;margin:auto}
+h1{font-size:1.5rem;margin:4px 0}.muted{color:#9eacc0;font-size:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:18px 0}
+.card{background:#1b293c;border:1px solid #31425a;border-radius:14px;padding:16px}
+.big{font-size:1.35rem;font-weight:700;margin-top:8px;overflow-wrap:anywhere}
+.status{display:inline-block;padding:5px 10px;border-radius:99px;background:#35445a}
+.ok{background:#145b42}.bad{background:#852f37}.warn{background:#78551b}
+button{border:0;border-radius:10px;padding:12px 15px;margin:5px 5px 5px 0;font-weight:700;cursor:pointer;background:#3c83e6;color:white}
+button.secondary{background:#46566d}button.danger{background:#c33d49}
+a{color:#82b8ff}input{padding:10px;border-radius:8px;border:1px solid #50627a;background:#111c2b;color:white;width:100%;margin:5px 0}
+#log{height:170px;overflow:auto;white-space:pre-wrap;background:#0b1220;padding:12px;border-radius:9px;font:12px monospace}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+small{color:#9eacc0}.wide{grid-column:1/-1}
+</style>
+</head>
+<body>
+<h1>🚗 ESP32 智慧車輛安全監控</h1>
+<div class="muted">手機／電腦 MQTT 即時監控｜車輛代號 car01</div>
+
+<div class="grid">
+  <section class="card">
+    <div class="muted">MQTT 連線</div><div id="connection" class="big"><span class="status bad">未連線</span></div>
+    <small>broker.hivemq.com · WebSocket TLS</small>
+  </section>
+  <section class="card">
+    <div class="muted">防盜狀態</div><div id="security" class="big">等待資料</div>
+  </section>
+  <section class="card">
+    <div class="muted">事故狀態</div><div id="crash" class="big">等待資料</div>
+  </section>
+  <section class="card">
+    <div class="muted">加速度合量</div><div id="accel" class="big">-- m/s²</div>
+  </section>
+  <section class="card wide">
+    <div class="muted">GPS 即時位置</div>
+    <div id="gps" class="big">等待 GPS 定位</div>
+    <div class="row" style="margin-top:10px">
+      <a id="map" href="#" target="_blank" rel="noopener">開啟 Google Maps</a>
+      <small id="gpsTime"></small>
+    </div>
+  </section>
+  <section class="card wide">
+    <div class="muted">車輛控制</div>
+    <div class="row">
+      <button onclick="sendCmd('ARM')">啟動防盜 ARM</button>
+      <button class="secondary" onclick="sendCmd('DISARM')">解除防盜 DISARM</button>
+      <button onclick="sendCmd('LOCATE')">立即尋車 LOCATE</button>
+      <button class="danger" onclick="sendCmd('ACK_CRASH')">確認事故 ACK</button>
+    </div>
+    <small>控制指令會透過 MQTT 傳送至 ESP32。</small>
+  </section>
+  <section class="card wide">
+    <div class="muted">MQTT 事件紀錄</div><div id="log">尚無事件</div>
+  </section>
+  <section class="card wide">
+    <div class="muted">連線設定（需與 ESP32 使用相同 Topic）</div>
+    <label>車輛 Topic 前綴</label><input id="prefix" value="car01">
+    <button class="secondary" onclick="reconnect()">套用 Topic 並重新連線</button>
+    <small>公開測試 Broker 不具私密性；請勿用於正式防盜或傳送敏感資料。</small>
+  </section>
+</div>
+
+<script>
+const broker = "wss://broker.hivemq.com:8884/mqtt";
+let client = null;
+let prefix = "car01";
+
+function logLine(s){
+  const box=document.getElementById("log");
+  if(box.textContent==="尚無事件") box.textContent="";
+  box.textContent=new Date().toLocaleTimeString()+"  "+s+"\n"+box.textContent;
+}
+function setConn(ok,text){
+  document.getElementById("connection").innerHTML =
+    `<span class="status ${ok?'ok':'bad'}">${text}</span>`;
+}
+function connect(){
+  if(client){try{client.end(true)}catch(e){}}
+  setConn(false,"連線中...");
+  client=mqtt.connect(broker,{clientId:"car01_web_"+Math.random().toString(16).slice(2),
+    clean:true,connectTimeout:10000,reconnectPeriod:3000});
+  client.on("connect",()=>{
+    setConn(true,"已連線");
+    client.subscribe(prefix+"/status");
+    client.subscribe(prefix+"/event");
+    logLine("MQTT 已連線，訂閱 "+prefix+"/#");
+  });
+  client.on("reconnect",()=>setConn(false,"重新連線中"));
+  client.on("error",e=>{setConn(false,"連線錯誤");logLine("錯誤："+e.message)});
+  client.on("offline",()=>setConn(false,"離線"));
+  client.on("message",(topic,payload)=>{
+    const raw=payload.toString();
+    let data;
+    try{data=JSON.parse(raw)}catch(e){logLine(topic+" "+raw);return}
+    if(topic===prefix+"/status") updateStatus(data);
+    if(topic===prefix+"/event"){
+      logLine("事件："+(data.event||raw)+" | GPS "+(data.lat??"--")+","+(data.lon??"--"));
+      if(data.event==="CRASH_SOS"){
+        document.getElementById("crash").innerHTML='<span class="status bad">⚠ 碰撞 SOS</span>';
+      }
+      if(data.lat && data.lon) updateGPS(data.lat,data.lon,true);
+    }
+  });
+}
+function updateStatus(d){
+  document.getElementById("security").innerHTML = d.alarm
+    ? '<span class="status bad">DANGER 警報中</span>'
+    : d.armed ? '<span class="status warn">防盜已啟動</span>'
+    : '<span class="status ok">SAFE 安全</span>';
+  document.getElementById("crash").innerHTML = d.crash
+    ? '<span class="status bad">⚠ 碰撞已觸發</span>'
+    : '<span class="status ok">正常</span>';
+  document.getElementById("accel").textContent =
+    Number(d.accel||0).toFixed(2)+" m/s²";
+  if(d.gps_valid) updateGPS(d.lat,d.lon,false);
+}
+function updateGPS(lat,lon,isEvent){
+  if(!Number.isFinite(Number(lat))||!Number.isFinite(Number(lon)))return;
+  document.getElementById("gps").textContent=Number(lat).toFixed(6)+", "+Number(lon).toFixed(6);
+  document.getElementById("map").href=`https://www.google.com/maps?q=${lat},${lon}`;
+  document.getElementById("gpsTime").textContent="更新："+new Date().toLocaleTimeString();
+}
+function sendCmd(cmd){
+  if(!client||!client.connected){logLine("尚未連線，無法傳送 "+cmd);return}
+  client.publish(prefix+"/cmd",cmd);
+  logLine("已送出指令："+cmd);
+}
+function reconnect(){
+  const v=document.getElementById("prefix").value.trim();
+  if(!/^[a-zA-Z0-9/_-]+$/.test(v)){alert("Topic 前綴格式不正確");return}
+  prefix=v;connect();
+}
+connect();
+</script>
+</body>
+</html>
